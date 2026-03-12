@@ -1,9 +1,9 @@
 {
-  "name": "node-mcintosh",
-  "version": "2.0.1",
-  "description": "McIntosh Line Device Control via RS232",
+  "name": "node-belcanto",
+  "version": "1.0.0",
+  "description": "BelCanto Line Device Control via RS232",
   "main": "lib.js",
-  "author": "Stefan Kruzlik",
+  "author": "Dave Mulder",
   "license": "Apache-2.0",
   "dependencies": {
     "serialport": "^12.0.0",
