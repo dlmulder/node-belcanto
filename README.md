@@ -1,17 +1,17 @@
-# McIntosh Line Device Control via RS232
+# BelCanto Device Control via RS232
 
-The McIntosh RS232 protocol implementation is based on [McIntosh Labs equipment control](https://community.particle.io/t/mcintosh-labs-audio-equipment-control/16338) article and documentation.
+The BelCanto RS232 protocol implementation is based on [Belcanto AMiP RS232 Codes v1.2.pdf](https://www.plaudio.com/pdf/docs/Belcanto%20AMiP%20RS232%20Codes%20v1.2.pdf) documentation.
 
-Configure your McIntosh:
+Configure your BelCanto:
 
-* Link speed: 115200
-* Identifier: McIntosh
+* Link speed: 9600
+* Identifier: BelCanto
 
 Initialization:
 
 ```javascript
-var McIntosh = require("node-mcintosh");
-var d = new McIntosh();
+var BelCanto = require("node-belcanto");
+var d = new BelCanto();
 ```
 
 Listening to events:
@@ -30,30 +30,19 @@ d.on('changed', function(property, value) { });
 
 `property` can be one of the following:
 
-* `'power_on'`
-* `'power_off'`
 * `'volume'`
-* `'source'`
+* `'input'`
 * `'mute'`
 
 Starting/Stopping the connection to the McIntosh device:
 
 ```javascript
-d.start(port, baud);
+d.start(port, baud, port_aux);
 ```
 
 * `port` should be like `'/dev/cu.usbserial'` or something similar on MacOS or Linux, or `'COM3'` on Windows
-* `baud` should be like `115200`, or whatever you configured your McIntosh to be (see above)
-
-
+* `baud` should be like `9600`
 
 ```javascript
 d.stop();
 ```
-McIntosh RS232 issues and workarounds
-
-	- C47 does not send any response when it goes in stand by. This means the extension would loose track of the current state.
-      Workaround used is to monitor USB state of the connected USB DAC (I am using the McIntosh C47's DAC via USB connection). C47 is closing DAC USB on standby.
-
-	 - I'm using the Passthru feature on C47 (for Hometheater), but when this mode is initialized, there is no indication via RS232.
-      Workaround is based on RS232 OP1 command response (output 1) which is returned back at this moment.

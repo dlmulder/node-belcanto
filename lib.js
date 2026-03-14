@@ -1,7 +1,7 @@
 "use strict";
 
 const {SerialPort} = require("serialport");
-const {ReadlineParser} = require('@serialport/parser-readline');
+const {ByteLengthParser} = require('@serialport/parser-byte-length');
 let util = require("util"),
 events = require('events');
 const {usb} = require('usb');
@@ -23,7 +23,7 @@ let _processw = function () {
         return
 
     this._woutstanding = true;
-    if(this._qw[0].length <= 4)
+    /*if(this._qw[0].length <= 4)
         console.log("[BelCanto] writing", this._qw[0].length, ":",
             this._qw[0][0].toString(16),
             this._qw[0][1].toString(16),
@@ -36,6 +36,7 @@ let _processw = function () {
             this._qw[0][2].toString(16),
             this._qw[0][3].toString(16),
             this._qw[0][4].toString(16))
+    */
 
     this._port.write(
         this._qw[0],
@@ -68,9 +69,9 @@ const FLAG = 0x7e
 
 // second byte Type
 const TYPE_MSB = 0x80
-const TYPE_STATUS = 0x20    // 1=Ack/Nack, 0=other
-const  TYPE_ACK = 0x06
-const  TYPE_NACK = 0x15
+const TYPE_ACKNACK = 0x20   // 1=Ack/Nack in data[0], 0=other
+const  ACK = 0x06
+const  NACK = 0x15
 const TYPE_SIZE_MASK = 0x0f // number of data bytes - 1
 
 // third byte Command
@@ -91,9 +92,9 @@ const MUTE = {
 
 function make_tx_command(command, data, read_not_write=false) {
     if(command == COMMAND.AckRxWrite)
-        return make_tx_command_(rx_packet.command, TYPE_STATUS, [TYPE_ACK], false)
+        return make_tx_command_(rx_packet.command, TYPE_ACKNACK, [ACK], false)
     else if(command == COMMAND.NackRxWrite)
-        return make_tx_command_(rx_packet.command, TYPE_STATUS, [TYPE_NACK], false)
+        return make_tx_command_(rx_packet.command, TYPE_ACKNACK, [NACK], false)
     else
         return make_tx_command_(command, 0, data, read_not_write)
 }
@@ -132,13 +133,17 @@ function make_tx_command_(command, type, data, read_not_write) {
 
 // the most recent received data, separated into fields
 let rx_packet = {
-    type:0, command:0, data:0, checksum:0
+    type:0, command:0, data:[], checksum:0
 }
 const RX_PACKET_STATE = { rx_idle:0, rx_type:1, rx_command:2, rx_data:3, rx_data_dle:4, rx_checksum:5, rx_checksum_dle:6 }
 let rx_packet_state = RX_PACKET_STATE.rx_idle
-let rx_packet_checksum = 0
 let rx_packet_datalen = 0
-function parse_rx_byte(b) {
+
+function parse_rx_byte(b)
+{
+    let result = null
+    let error_string = ""
+
     switch(rx_packet_state) {
     case RX_PACKET_STATE.rx_idle:
         if(b == FLAG)
@@ -146,10 +151,10 @@ function parse_rx_byte(b) {
         break;
     case RX_PACKET_STATE.rx_type:
         if((b & TYPE_MSB) == TYPE_MSB) {
-            rx_packet_checksum = b
+            rx_packet.checksum = b
             rx_packet.type = b
-            rx_packet_datalen = b & TYPE_SIZE_MASK
-            if((rx_packet_datalen > 0) && (rx_packet_datalen <= 16))
+            rx_packet_datalen = (b & TYPE_SIZE_MASK) + 1
+            if((rx_packet_datalen >= 0) && (rx_packet_datalen < 16))
                 rx_packet_state = RX_PACKET_STATE.rx_command
             else
                 rx_packet_state = RX_PACKET_STATE.rx_idle
@@ -158,33 +163,36 @@ function parse_rx_byte(b) {
         }
         break;
     case RX_PACKET_STATE.rx_command:
-        if((b & COMMAND_MSB_MSB) == COMMAND_MSB) {
+        if(((b & COMMAND_MSB) == COMMAND_MSB) || ((rx_packet.type & TYPE_ACKNACK) == TYPE_ACKNACK)) {
             rx_packet.command = b
-            rx_packet_checksum += b
+            rx_packet.checksum += b
 
             rx_packet_state = RX_PACKET_STATE.rx_data
-        } else
+        } else {
             rx_packet_state = RX_PACKET_STATE.rx_idle
+        }
         break;
     case RX_PACKET_STATE.rx_data:
         if(b != DLE) {
             if(rx_packet_datalen > 0) {
                 --rx_packet_datalen
                 rx_packet.data[rx_packet_datalen] = b
-                rx_packet_checksum += b
+                rx_packet.checksum += b
 
                 if(rx_packet_datalen == 0)
                     rx_packet_state = RX_PACKET_STATE.rx_checksum
             } else
                 rx_packet_state = RX_PACKET_STATE.rx_idle
         }
-        else
-            rx_packet_state = RX_PACKET_STATE.rx_data_dle   // throw away this DLE byte
+        else {
+            rx_packet_state = RX_PACKET_STATE.rx_data_dle   // throw away this DLE byte and "fix" the next one
+        }
         break;
     case RX_PACKET_STATE.rx_data_dle:
         --rx_packet_datalen
-        rx_packet.data[rx_packet_datalen] = b ^ XORCHR
-        rx_packet_checksum += b ^ XORCHR
+        let corrected_b = b ^ XORCHR
+        rx_packet.data[rx_packet_datalen] = corrected_b
+        rx_packet.checksum += corrected_b
 
         if(rx_packet_datalen == 0)
             rx_packet_state = RX_PACKET_STATE.rx_checksum
@@ -194,60 +202,72 @@ function parse_rx_byte(b) {
     case RX_PACKET_STATE.rx_checksum:
         if(b != DLE) {
             if(b == rx_packet.checksum % 256)
-                handle_rx_packet()
+                result = rx_packet
             else
-                rx_packet_state = RX_PACKET_STATE.rx_idle
-        } else
+                error_string = "[BelCanto] received invalid checksum"
+            rx_packet_state = RX_PACKET_STATE.rx_idle
+        } else {
             rx_packet_state = RX_PACKET_STATE.rx_checksum_dle
+        }
         break;
     case RX_PACKET_STATE.rx_checksum_dle:
-        if(b == rx_packet.checksum % 256)
-            handle_rx_packet()
+        corrected_b = b ^ XORCHR
+        if(corrected_b == rx_packet.checksum % 256)
+            result = rx_packet
         else
             rx_packet_state = RX_PACKET_STATE.rx_idle
         break;
     }
+
+    if(error_string)
+        console.log(error_string)
+    if(error_string && result)
+        console.log(
+            rx_packet.type.toString(16),
+            rx_packet.command.toString(16),
+            rx_packet.data[0].toString(16),
+            rx_packet.checksum.toString(16),
+            b)
+
+    return result    // null if not done with a full and correct packet
 }
-function handle_rx_packet() {
-    if((rx_packet.type & TYPE_ACK) == TYPE_NACK) {
-    }
-    else {  // ACKs or pushed values
-        switch(rx_packet.command) {
-        case COMMAND.Display:
-            break;
-        case COMMAND.Mute:
-            break;
-        case COMMAND.Input:
-            break;
-        case COMMAND.Volume:
-            break;
-        case COMMAND.Balance:
-            break;
-    }
-    }
+
+function display_to_bc_volume(vol100) {
+    if(vol100 >= 80)
+        return 200 + (vol100 - 100)
+    else
+        return 180 + (vol100 -  80) * 2
+}
+function bc_volume_to_display(vol200) {
+    if(vol200 >= 180)
+        return 100 + (vol200 - 200)
+    else
+        return 80 + (vol200 - 180) / 2
 }
 
 BelCanto.prototype.volume_up = function () {
     if(this.volume < 0)
         send.call(this, make_tx_command(COMMAND.Volume, 0, true))
     else
-        send.call(this, make_tx_command(COMMAND.Volume, this.volume + 1));
+        send.call(this, make_tx_command(COMMAND.Volume, display_to_bc_volume(this.volume + 1)));
 };
 BelCanto.prototype.volume_down = function () {
     if(this.volume < 0)
         send.call(this, make_tx_command(COMMAND.Volume, 0, true))
     else
-        send.call(this, make_tx_command(COMMAND.Volume, this.volume - 1));
+        send.call(this, make_tx_command(COMMAND.Volume, display_to_bc_volume(this.volume - 1)));
 };
 BelCanto.prototype.set_volume = function (val) {
-    console.log("[BelCanto lib.js] executing prototype.set_volume");
-    if (this.properties.volume == val)
-        return;
+    console.log("[BelCanto lib.js] prototype.set_volume", val, this.properties.volume);
+    //if (this.properties.volume == val)
+    //    return;
     if (this.volumetimer)
         clearTimeout(this.volumetimer);
-    var self = this;
     this.volumetimer = setTimeout(() => {
-        send.call(this, make_tx_command(COMMAND.Volume, val));
+        let bc_volume = display_to_bc_volume(val)
+        let s = make_tx_command(COMMAND.Volume, bc_volume)
+        console.log("[BelCanto lib.js] executing prototype.set_volume", bc_volume, s);
+        send.call(this, s);
     }, 50)
 };
 BelCanto.prototype.get_status = function () {
@@ -278,8 +298,8 @@ BelCanto.prototype.init = function (opts, closecb) {
 
     this.properties = {
         volume: opts.volume || 1,
-        source: opts.source || '8',
-        usbVid: opts.usbVid
+        mute:   opts.mute || true,
+        input:  opts.input || '8',
     };
 
     this.initializing = true;
@@ -289,83 +309,62 @@ BelCanto.prototype.init = function (opts, closecb) {
         path: opts.port,
         baudRate: opts.baud || 115200
     });
-    this._parser = new ReadlineParser({
-        delimiter: ')'
+    this._parser = new ByteLengthParser({
+        length: 1
     });
     this._port.pipe(this._parser);
 
-    console.log("[BelCanto] subscribing to 'data'")
     this._parser.on('data', data => {
         if (this.initializing) {
             this.initializing = false;
             this.emit('connected');
         }
-        console.log('[BelCanto] received: %s', data.toHex());
-/*
-        if (/^\(VST.* ([0-9]*)$/.test(data)) {
-            let val = Number(data.trim().replace(/^\(VST.* ([0-9]*)$/, "$1"));
-            if (this.properties.volume != val) {
-                console.log('Changing volume from %d to %d', this.properties.volume, val);
-                this.properties.volume = val;
-                this.emit('volume', val);
-            }
-        } else if (/^.*\(POF.*$/.test(data)) {
-            let val = "Standby";
-            if (this.properties.source != val) {
-                this.properties.source = val;
-                this.emit('source', val);
-            }
 
-        } else if (/^.*\(MUT.* 1$/.test(data)) { // Mute or Muted
-            let val = "Muted";
-            if (this.properties.source != val) {
-                this.properties.source = val;
-                this.emit('source', val);
-            }
+        let rx = parse_rx_byte(data[0])
+        if(rx != null)
+        {
+            console.log("[BelCanto] rx packet", rx.command & COMMAND_MASK, rx.data[0],
+                (rx.type & TYPE_ACKNACK)? (rx.data[0]==ACK)? "ACK" : "NACK" : "")
 
-        } else if (/^.*\(MUT.* 0$/.test(data)) { // UnMute or UnMuted
-            let val = "UnMuted";
-            if (this.properties.source != val) {
-                this.properties.source = val;
-                this.emit('source', val);
-            }
+            if((rx.type & TYPE_ACKNACK) != TYPE_ACKNACK)
+            {
+                let val = rx.data[0]
 
-        } else if (/^.*\(INP.* ([0-9]*)$/.test(data)) {
-            let val = data.trim().replace(/^.*\(INP.* ([0-9]*)$/, "$1");
-            if (this.properties.source != val) {
-                this.properties.source = val;
-                this.emit('source', val);
-            }
-
-        } else if (/^.*\(OP1.* ([0-9])$/.test(data)) {
-            let val = "Passthru";
-            if (this.properties.source != val) {
-                this.properties.source = val;
-                this.emit('source', val);
-            }
-
-        } else if (/^.*\(PWR .*$/.test(data)) {
-            //if PWR is received, device that is not using Zones is in use -> use 'NoZone' mode
-            this.serialCommandMode = "NoZone";
-
-            if (/^.*\(PWR 0$/.test(data)) {
-              let val = "Standby";
-              if (this.properties.source != val) {
-                  this.properties.source = val;
-                  this.emit('source', val);
-              }
-            }
-        } else if (/^\(VOL ([0-9]*)$/.test(data)) {
-            let val = Number(data.trim().replace(/^\(VOL ([0-9]*)$/, "$1"));
-            if (this.properties.volume != val) {
-                console.log('Changing volume from %d to %d', this.properties.volume, val);
-                this.properties.volume = val;
-                this.emit('volume', val);
-            } else {
-                console.log('No matching string');
+                switch(rx.command & COMMAND_MASK) {
+                case COMMAND.Display:
+                    console.log('[BelCanto] rx ignored Display');
+                    break;
+                case COMMAND.Mute:
+//                    if (this.properties.source != val) {
+                        console.log('[BelCanto] rx mute: %s', val);
+                        this.properties.source = val;
+                        this.emit('mute', val);
+//                    }
+                    break;
+                case COMMAND.Input:
+//                    if (this.properties.source != val) {
+                        console.log('[BelCanto] rx source: %s', val);
+                        this.properties.source = val;
+                        this.emit('source', val);
+//                    }
+                    break;
+                case COMMAND.Volume:
+//                    if (this.properties.volume != val) {
+                        let display_volume = bc_volume_to_display(val)
+                        console.log('[BelCanto] rx volume: %d to %d', this.properties.volume, display_volume);
+                        this.properties.volume = display_volume;
+                        this.emit('volume', display_volume);
+//                    }
+                    break;
+                case COMMAND.Balance:
+                    console.log('[BelCanto] rx ignored Balance');
+                    break;
+                default:
+                    console.log("[BelCanto] rx ignored unknown command", rx.command.toString(16))
+                    break;
+                }
             }
         }
-*/
     });
 
     let timer = setTimeout(() => {
