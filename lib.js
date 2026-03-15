@@ -258,15 +258,10 @@ BelCanto.prototype.volume_down = function () {
         send.call(this, make_tx_command(COMMAND.Volume, display_to_bc_volume(this.volume - 1)));
 };
 BelCanto.prototype.set_volume = function (val) {
-    console.log("[BelCanto lib.js] prototype.set_volume", val, this.properties.volume);
-    //if (this.properties.volume == val)
-    //    return;
-    if (this.volumetimer)
-        clearTimeout(this.volumetimer);
-    this.volumetimer = setTimeout(() => {
+    this.timer = setTimeout(() => {
         let bc_volume = display_to_bc_volume(val)
         let s = make_tx_command(COMMAND.Volume, bc_volume)
-        console.log("[BelCanto lib.js] executing prototype.set_volume", bc_volume, s);
+        console.log("[BelCanto lib.js] set_volume", bc_volume, s);
         send.call(this, s);
     }, 50)
 };
@@ -280,10 +275,24 @@ BelCanto.prototype.power_on = function () {
     // unimplemented
 };
 BelCanto.prototype.set_source = function (val) {
-    send.call(this, make_tx_command(COMMAND.Input, val));
+    let bc_input = Number(val)
+    this.timer = setTimeout(() => {
+        let s = make_tx_command(COMMAND.Input, bc_input)
+        console.log("[BelCanto lib.js] set_source", bc_input, s);
+        send.call(this, s);
+    }, 50)
+}
+BelCanto.prototype.set_display = function (val) {
+    let bc_display = (val == "on") ? MUTE.ON : MUTE.OFF
+    this.timer = setTimeout(() => {
+        let s = make_tx_command(COMMAND.Display, bc_display)
+        console.log("[BelCanto lib.js] set_display", val, bc_display, s);
+        send.call(this, s);
+    }, 50)
 };
 BelCanto.prototype.mute = function (val) {
-    send.call(this, make_tx_command(COMMAND.Mute, val));
+    let bc_mute = val ? MUTE.ON : MUTE.OFF
+    send.call(this, make_tx_command(COMMAND.Mute, bc_mute));
 };
 
 BelCanto.prototype.raw_command = function (val) {
@@ -335,26 +344,21 @@ BelCanto.prototype.init = function (opts, closecb) {
                     console.log('[BelCanto] rx ignored Display');
                     break;
                 case COMMAND.Mute:
-//                    if (this.properties.source != val) {
-                        console.log('[BelCanto] rx mute: %s', val);
-                        this.properties.source = val;
-                        this.emit('mute', val);
-//                    }
+                    let display_mute = val == MUTE.ON ? "Muted" : "UnMuted"
+                    console.log('[BelCanto] rx mute: %s', val, display_mute);
+                    this.properties.source = display_mute;
+                    this.emit('source', display_mute);
                     break;
                 case COMMAND.Input:
-//                    if (this.properties.source != val) {
-                        console.log('[BelCanto] rx source: %s', val);
-                        this.properties.source = val;
-                        this.emit('source', val);
-//                    }
+                    console.log('[BelCanto] rx source: %s', val);
+                    this.properties.source = val;
+                    this.emit('source', val);
                     break;
                 case COMMAND.Volume:
-//                    if (this.properties.volume != val) {
-                        let display_volume = bc_volume_to_display(val)
-                        console.log('[BelCanto] rx volume: %d to %d', this.properties.volume, display_volume);
-                        this.properties.volume = display_volume;
-                        this.emit('volume', display_volume);
-//                    }
+                    let display_volume = bc_volume_to_display(val)
+                    console.log('[BelCanto] rx volume: %d to %d', this.properties.volume, display_volume);
+                    this.properties.volume = display_volume;
+                    this.emit('volume', display_volume);
                     break;
                 case COMMAND.Balance:
                     console.log('[BelCanto] rx ignored Balance');
@@ -367,7 +371,7 @@ BelCanto.prototype.init = function (opts, closecb) {
         }
     });
 
-    let timer = setTimeout(() => {
+    this.timer = setTimeout(() => {
         if (this.initializing) {
             this.initializing = false;
             this.emit('connected');
