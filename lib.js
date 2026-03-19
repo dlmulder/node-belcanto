@@ -4,7 +4,11 @@ const {SerialPort} = require("serialport");
 const {ByteLengthParser} = require('@serialport/parser-byte-length');
 let util = require("util"),
 events = require('events');
-const { buffer } = require("stream/consumers");
+
+const rx_bytes1 = [];
+const rx_bytes2 = [];
+const rx_packets1 = [];
+const rx_packets2 = [];
 
 function BelCanto() {
     this.seq = 0;
@@ -20,80 +24,14 @@ function BelCanto() {
     this.req_bc_source = null;
     this.act_bc_source1 = null;
     this.act_bc_source2 = null;
-    console.log("[BelCanto lib.js] creating BelCanto instance");
 }
 
 util.inherits(BelCanto, events.EventEmitter);
 
-let writeQueue = Promise.resolve()
-const writeToPort = (port, data, id) => {
-    writeQueue = writeQueue.then(() => {
-        return new Promise((resolve, reject) => {
-            port.write(data, (err) => {
-                if (err) reject(err);
-                else resolve();
-            });
-        });
-    });
-    return writeQueue;
-}
 
-const tx_queue = []
-function queue_tx(id, command) {
-    tx_queue.push({id: id, command: command})
-}
-function send_next_tx() {
-    if(tx_queue.length > 0) {
-        let p = tx_queue.shift()
-
-        if(p.command == COMMAND.Volume) {
-            if(this.req_bc_volume != this.act_bc_volume) {
-                let s = make_tx_command(COMMAND.Volume, this.req_bc_volume)
-                if(p.id == null) {
-                    writeToPort(this.port1, s, 1);
-                    writeToPort(this.port2, s, 2);
-                } else if(p.id == 1)
-                    writeToPort(this.port1, s, 1);
-                else
-                    writeToPort(this.port2, s, 2);
-            }
-        }
-        else if(p.command == COMMAND.Source) {
-            if(this.req_bc_source != this.act_bc_source) {
-                let s = make_tx_command(COMMAND.Input, this.req_bc_source)
-                if(p.id == null) {
-                    writeToPort(this.port1, s, 1);
-                    writeToPort(this.port2, s, 2);
-                } else if(p.id == 1)
-                    writeToPort(this.port1, s, 1);
-                else
-                    writeToPort(this.port2, s, 2);
-            }
-        }
-        else if(p.command == COMMAND.Display) {
-            let s = make_tx_command(COMMAND.Display, this.req_bc_display)
-            if(p.id == null) {
-                writeToPort(this.port1, s, 1);
-                writeToPort(this.port2, s, 2);
-            } else if(p.id == 1)
-                writeToPort(this.port1, s, 1);
-            else
-                writeToPort(this.port2, s, 2);
-        }
-        else if(p.command == COMMAND.Mute) {
-            if(this.req_bc_mute != this.act_bc_mute) {
-                let s = make_tx_command(COMMAND.Mute, this.req_bc_mute);
-                if(p.id == null) {
-                    writeToPort(this.port1, s, 1);
-                    writeToPort(this.port2, s, 2);
-                } else if(p.id == 1)
-                    writeToPort(this.port1, s, 1);
-                else
-                    writeToPort(this.port2, s, 2);
-            }
-        }
-    }
-}
+//
+// Bel Canto RS232 API
+//
 
 // codes from
 // https://www.plaudio.com/pdf/docs/Belcanto%20AMiP%20RS232%20Codes%20v1.2.pdf
@@ -132,56 +70,249 @@ const MUTE = {
     OFF:0xe0, ON:0xe1, SOFT:0xe2    // also display ON/OFF
 }
 
-function make_tx_command(command, data, read_not_write=false) {
-    if(command == COMMAND.AckRxWrite)
-        return make_tx_command_(rx_packet.command, TYPE_ACKNACK, [ACK], false)
-    else if(command == COMMAND.NackRxWrite)
-        return make_tx_command_(rx_packet.command, TYPE_ACKNACK, [NACK], false)
+function display_to_bc_volume(vol100) {
+    if(vol100 >= 80)
+        return 200 + (vol100 - 100)
     else
-        return make_tx_command_(command, 0, data, read_not_write)
+        return 180 + (vol100 -  80) * 2
 }
-function make_tx_command_(command, type, data, read_not_write) {
-    console.log("make_tx data", data)
-    if(typeof(data) == "number")
-        data = [data]
-    let datacount = data.length
-    if(datacount > 0)
-        datacount -= 1
+function bc_volume_to_display(vol200) {
+    if(vol200 >= 180)
+        return 100 + (vol200 - 200)
+    else
+        return 80 + (vol200 - 180) / 2
+}
 
-    let cmd = [FLAG]
+BelCanto.prototype.request_volume = function(vol) {
+    this.req_bc_volume = display_to_bc_volume(vol)
+}
+BelCanto.prototype.request_mute = function(mute) {
+    this.req_bc_mute = mute? MUTE.ON : MUTE.OFF
+}
 
-    let type_byte = TYPE_MSB | type | datacount
-    cmd.push(type_byte)
+BelCanto.prototype.volume_up = function (id=null) {
+    this.req_bc_volume = display_to_bc_volume(this.volume + 1)
+};
+BelCanto.prototype.volume_down = function (id=null) {
+    this.req_bc_volume = display_to_bc_volume(this.volume - 1)
+};
 
-    let command_byte = COMMAND_MSB | (read_not_write?COMMAND_READ:0) | command
-    cmd.push(command_byte)
-    for(let i = 0; i <= datacount; ++i) {
-        let b = data[i]
-        if((b == DLE) || (b == FLAG)) {
-            cmd.push(DLE)
-            b ^= XORCHR
+BelCanto.prototype.init = function (opts, closecb1, closecb2) {
+    this.qw1 = [];
+    this.qw2 = [];
+    this.woutstanding1 = false;
+    this.woutstanding2 = false;
+
+    this.properties = { // current values
+        volume: null,
+        mute: null,
+        source: null,
+        display: null
+    };
+
+    this.initializing = true;
+
+    // port 1
+    this.port1 = new SerialPort({
+        path: opts.port1,
+        baudRate: opts.baud || 9600
+    });
+    this.parser1 = new ByteLengthParser({
+        length: 1
+    });
+    this.port1.pipe(this.parser1);
+    this.rx_data1 = []
+    handle_system_events.call(this, rx_bytes1, this.parser1, this.port1, closecb1)
+
+    // port 2
+    if(opts.port2) {
+        this.port2 = new SerialPort({
+            path: opts.port2,
+            baudRate: opts.baud || 9600
+        });
+        this.parser2 = new ByteLengthParser({
+            length: 1
+        });
+        this.port2.pipe(this.parser2);
+        this.rx_data2 = []
+        handle_system_events.call(this, rx_bytes2, this.parser2, this.port2, closecb2)
+    } else
+        this.port2 = null
+
+    // set the values for the queued commands to request
+    this.act_bc_volume1 = -1;
+    this.act_bc_volume2 = -1;
+    this.req_bc_source = Number(opts.source);
+    this.req_bc_volume = display_to_bc_volume(Number(opts.volume));
+    this.req_bc_display = (opts.display)? MUTE.ON : MUTE.OFF;
+    this.req_bc_mute = MUTE.OFF;
+
+    this.rx_packet1 = [];
+    this.rx_packet2 = [];
+    this.next_tx_state = 0;
+    handle_timers.call(this)
+}
+
+BelCanto.prototype.start = function (opts) {
+    this.seq++;
+
+    let closecb1 = (why) => {
+        this.emit('disconnected');
+        if (why != 'close') {
+            var seq = ++this.seq;
+            setTimeout(() => {
+                if (seq != this.seq)
+                    return;
+                this.start(opts);
+            }, 1000);
         }
-        cmd.push(b)
-    }
+    };
+    let closecb2 = (why) => {
+        this.emit('disconnected');
+        if (why != 'close') {
+            var seq = ++this.seq;
+            setTimeout(() => {
+                if (seq != this.seq)
+                    return;
+                this.start(opts);
+            }, 1000);
+        }
+    };
 
-    let checksum = type_byte
-    checksum += command_byte
-    for(let i = 0; i <= datacount; ++i) {
-        checksum += data[i]
+    if (this.port) {
+        this.port.close(() => {
+            this.init(opts, closecb1, closecb2);
+        });
+    } else {
+        this.init(opts, closecb1, closecb2);
     }
-    cmd.push(checksum % 256)
+};
 
-    return Buffer.from(cmd)
+BelCanto.prototype.stop = function () {
+    this.seq++;
+    if (this.port)
+        this.port.close(() => {});
+};
+
+
+//
+// handlers
+//
+
+function handle_system_events(rx_bytes, parser, port, closecb) {
+    parser.on('data', data => {
+        rx_bytes.push(...data)
+    });
+
+    port.on('open', err => {
+        this.emit('preconnected');
+    });
+
+    port.on('close', () => {
+        port.close(() => {
+            port = undefined;
+            if (closecb) {
+                var cb2 = closecb;
+                closecb = undefined;
+                cb2('close');
+            }
+        })
+    });
+    port.on('error', err => {
+        port.close(() => {
+            port = undefined;
+            if (closecb) {
+                var cb2 = closecb;
+                closecb = undefined;
+                cb2('error');
+            }
+        })
+    });
+    port.on('disconnect', () => {
+        port.close(() => {
+            port = undefined;
+            if (closecb) {
+                var cb2 = closecb;
+                closecb = undefined;
+                cb2('disconnect');
+            }
+        })
+    });
+};
+
+function handle_timers() {
+    // timer tasks to parse the incoming bytes into packets, to handle those packets, and to send queued tx packets
+    const rx_bytes_timer1 = setInterval(() => {
+        if(rx_bytes1.length > 0) {
+            for(let i = 0; i < rx_bytes1.length; ++i) {
+                let b = rx_bytes1[i]
+            let p = parse_rx_byte(b, 1, this.rx_packet1)
+            if(p != null) {
+                rx_packets1.push(Array.from(p))
+                this.rx_packet1.length = 0
+                }
+            }
+            rx_bytes1.length = 0
+        }
+    }, 2)
+
+    const rx_bytes_timer2 = setInterval(() => {
+        if(rx_bytes2.length > 0) {
+            for(let i = 0; i < rx_bytes2.length; ++i) {
+                let b = rx_bytes2[i]
+                let p = parse_rx_byte(b, 2, this.rx_packet2)
+                if(p != null) {
+                    rx_packets2.push(Array.from(p))
+                    this.rx_packet2.length = 0
+                    p = null
+                }
+            }
+            rx_bytes2.length = 0
+        }
+    }, 2)
+
+    const rx_packets_timer1 = setInterval(() => {
+        if(rx_packets1.length > 0) {
+            for(let i = 0; i < rx_packets1.length; ++i) {
+                let p = rx_packets1[i]
+                handle_rx_packet.call(this, p, 1)
+            }
+            rx_packets1.length = 0
+        }
+
+        if (this.initializing) {
+            this.initializing = false;
+            this.emit('connected');
+        }
+    }, 25);
+
+    const rx_packets_timer2 = setInterval(() => {
+        if(rx_packets2.length > 0) {
+            for(let i = 0; i < rx_packets2.length; ++i) {
+                let p = rx_packets2[i]
+                handle_rx_packet.call(this, p, 2)
+            }
+            rx_packets2.length = 0
+        }
+    }, 25);
+
+    const update_all_timer = setInterval(() => {
+        update_all.call(this)
+    }, 42)
 }
+
+
+//
+// RX
+//
 
 // the most recent received data
-const rx_packet = []
 const RX_PACKET_STATE = { rx_idle:0, rx_type:1, rx_command:2, rx_data:3, rx_data_dle:4, rx_checksum:5, rx_checksum_dle:6 }
 let rx_packet_checksum = 0
 let rx_packet_state = RX_PACKET_STATE.rx_idle
 let rx_packet_datalen = 0
 
-function parse_rx_byte(b, id)
+function parse_rx_byte(b, id, rx_packet)
 {
     let result = null
     let error_string = ""
@@ -207,7 +338,7 @@ function parse_rx_byte(b, id)
         }
         break;
     case RX_PACKET_STATE.rx_command:
-        if(((b & COMMAND_MSB) == COMMAND_MSB) || ((rx_packet.type & TYPE_ACKNACK) == TYPE_ACKNACK)) {
+        if(((b & COMMAND_MSB) == COMMAND_MSB) || ((rx_packet[PACKET_TYPE_INDEX] & TYPE_ACKNACK) == TYPE_ACKNACK)) {
             rx_packet.push(b)
             rx_packet_checksum += b
 
@@ -257,8 +388,8 @@ function parse_rx_byte(b, id)
         break;
     case RX_PACKET_STATE.rx_checksum_dle:
         corrected_b = b ^ XORCHR
-        rx_packet.checksum %= 256
-        if(corrected_b == rx_packet.checksum)
+        rx_packet_checksum %= 256
+        if(corrected_b == rx_packet_checksum)
             result = rx_packet
         else
             rx_packet_state = RX_PACKET_STATE.rx_idle
@@ -266,314 +397,191 @@ function parse_rx_byte(b, id)
     }
 
     if(error_string)
-        console.log(error_string, rx_packet)
-    else if(result)
-        console.log(id, result)
+        console.log("parse_rx_byte error:", error_string, rx_packet)
 
     return result    // null if not done with a full and correct packet
 }
 
-function display_to_bc_volume(vol100) {
-    if(vol100 >= 80)
-        return 200 + (vol100 - 100)
-    else
-        return 180 + (vol100 -  80) * 2
-}
-function bc_volume_to_display(vol200) {
-    if(vol200 >= 180)
-        return 100 + (vol200 - 200)
-    else
-        return 80 + (vol200 - 180) / 2
-}
+function handle_rx_packet(rx, id) {
+    let is_acknack = (rx[PACKET_TYPE_INDEX] & TYPE_ACKNACK) != 0
+    let is_ack = is_acknack && (rx[PACKET_DATA0_INDEX]==ACK)
+    let is_nack = is_acknack && (rx[PACKET_DATA0_INDEX]==NACK)
+    let is_report = ! is_acknack
 
-BelCanto.prototype.request_volume = function(vol) {
-    this.req_bc_volume = display_to_bc_volume(vol)
-    this.set_volume()
-}
-BelCanto.prototype.request_mute = function(mute) {
-    this.req_bc_mute = mute? MUTE.ON : MUTE.OFF
-    this.set_mute()
-}
+    if(is_nack)
+        console.log("handle_rx_packet%d got NACK", id, rx[PACKET_COMMAND_INDEX] & COMMAND_MASK, rx[PACKET_DATA0_INDEX])
 
-BelCanto.prototype.volume_up = function (id=null) {
-    return this.set_volume(this.volume + 1, id)
-};
-BelCanto.prototype.volume_down = function (id=null) {
-    return this.set_volume(this.volume - 1, id)
-};
-BelCanto.prototype.set_volume = function (id=null) {
-    queue_tx(id, COMMAND.Volume)
-};
+    let val = rx[PACKET_DATA0_INDEX]    // NOTE: val is not valid when ACK/NACK
 
-BelCanto.prototype.set_source = function (id=null) {
-    queue_tx(id, COMMAND.Source)
-}
-BelCanto.prototype.set_display = function (id=null) {
-    queue_tx(id, COMMAND.Display)
-};
-BelCanto.prototype.set_mute = function (id=null) {
-    queue_tx(id, COMMAND.Mute)
-};
-
-BelCanto.prototype.init = function (opts, closecb1, closecb2) {
-    this.qw1 = [];
-    this.qw2 = [];
-    this.woutstanding1 = false;
-    this.woutstanding2 = false;
-
-    this.properties = { // current values
-        volume: null,
-        mute: null,
-        source: null,
-        display: null
-    };
-
-    this.initializing = true;
-
-    // port 1
-    this.port1 = new SerialPort({
-        path: opts.port1,
-        baudRate: opts.baud || 9600
-    });
-    this.parser1 = new ByteLengthParser({
-        length: 1
-    });
-    this.port1.pipe(this.parser1);
-    handle_system_events.call(this, 1, this.parser1, this.port1, closecb1)
-
-    // port 2
-    if(opts.port2) {
-        this.port2 = new SerialPort({
-            path: opts.port2,
-            baudRate: opts.baud || 9600
-        });
-        this.parser2 = new ByteLengthParser({
-            length: 1
-        });
-        this.port2.pipe(this.parser2);
-        handle_system_events.call(this, 2, this.parser2, this.port2, closecb2)
-    } else
-        this.port2 = null
-
-    this.timer = setInterval(() => {
-        send_next_tx.call(this)
-    }, 100);   // ~5 bytes * 100us = 0.5ms
-
-    // set the values for the queued commands to request
-    this.req_bc_source = Number(opts.source);
-    this.req_bc_volume = display_to_bc_volume(Number(opts.volume));
-    this.req_bc_display = (opts.display)? MUTE.ON : MUTE.OFF;
-    this.req_bc_mute = MUTE.OFF;
-
-    // set initial properties of all devices
-    this.set_source(1)
-    this.set_source(2)
-    this.set_volume(1)
-    this.set_volume(2)
-    this.set_display(1)
-    this.set_display(2)
-    this.set_mute(1)
-    this.set_mute(2)
-}
-
-function handle_system_events(id, parser, port, closecb) {
-    parser.on('data', data => {
-        if (this.initializing) {
-            this.initializing = false;
-            this.emit('connected');
+    // the unit reported that a setting changed, either
+    // 1. someone changed it with an IR remote control or similar
+    //      in this case simply set the requested value, and that will cause an update to the other unit
+    // 2. an ACK is reported in reponse to this extension changing it
+    //      in this case we now know the unit is at the requested value
+    // 2. a NACK is reported when the unit can't change to the requested value
+    //      in this case the requested value will be changed back to the previous actual
+    switch(rx[PACKET_COMMAND_INDEX] & COMMAND_MASK) {
+    case COMMAND.Display:
+        if(is_report) {
+            this.req_bc_display = (val == MUTE.ON)? MUTE.ON : MUTE.OFF
+            console.log('[BelCanto %d] user changed display: %s', id, val);
         }
-
-        for(let i = 0; i < data.length; ++i) {
-            let rx = parse_rx_byte(data[i], id)
-            if(rx != null)
-            {
-                console.log("[BelCanto %d] rx packet", id, rx[PACKET_COMMAND_INDEX] & COMMAND_MASK, rx[PACKET_DATA0_INDEX],
-                    (rx[PACKET_TYPE_INDEX] & TYPE_ACKNACK)? (rx[PACKET_DATA0_INDEX]==ACK)? "ACK" : "NACK" : "")
-
-                if((rx[PACKET_TYPE_INDEX] & TYPE_ACKNACK) != TYPE_ACKNACK)
-                {
-                    let val = rx[PACKET_DATA0_INDEX]
-
-                    switch(rx[PACKET_COMMAND_INDEX] & COMMAND_MASK) {
-                    case COMMAND.Display:
-                        let bool_display = (val == MUTE.ON)
-                        console.log('[BelCanto %d] rx display: %s', id, val, bool_display);
-                        if((rx[PACKET_TYPE_INDEX] & TYPE_ACKNACK) == TYPE_ACKNACK) {
-                            if(id == 1)
-                                this.act_bc_display1 = this.req_bc_display
-                            else
-                                this.act_bc_display2 = this.req_bc_display
-                        } else {
-                            // the unit reported that the display mode was set, either because we set it or someone changed it
-                            // if we set it then these values (act and req) will already be the reported value
-                            this.req_bc_display = bool_display? MUTE.ON : MUTE.OFF
-                            if(id == 1)
-                                this.act_bc_display1 = this.req_bc_display
-                            else
-                                this.act_bc_display2 = this.req_bc_display
-                        }
-                        if((id == 1) && (this.act_bc_display2 != this.req_bc_display))
-                            this.set_display(2)
-                        else if((id == 2) && (this.act_bc_display1 != this.req_bc_display))
-                            this.set_display(1)
-                        break;
-                    case COMMAND.Mute:
-                        let display_mute = (val == MUTE.ON) ? "Muted" : "UnMuted"
-                        let bool_mute = (val == MUTE.ON)
-                        console.log('[BelCanto %d] rx mute: %s', id, val, display_mute);
-                        this.properties.source = display_mute;
-                        if((rx[PACKET_TYPE_INDEX] & TYPE_ACKNACK) == TYPE_ACKNACK) {
-                            if(id == 1)
-                                this.act_bc_mute1 = this.req_bc_mute
-                            else
-                                this.act_bc_mute2 = this.req_bc_mute
-                        } else {
-                            this.req_bc_mute = val
-                            if(id == 1)
-                                this.act_bc_mute1 = this.req_bc_mute
-                            else
-                                this.act_bc_mute2 = this.req_bc_mute
-                        }
-                        if((id == 1) && (this.act_bc_mute2 != this.req_bc_mute))
-                            this.set_mute(2)
-                        else if((id == 2) && (this.act_bc_mute1 != this.req_bc_mute))
-                            this.set_mute(1)
-                        if(this.properties.mute != bool_mute)
-                            this.emit('source', display_mute);
-                        this.properties.mute = bool_mute
-                        break;
-                    case COMMAND.Input:
-                        console.log('[BelCanto %d] rx source: %s', id, val);
-                        this.properties.source = val;
-                        if((rx[PACKET_TYPE_INDEX] & TYPE_ACKNACK) == TYPE_ACKNACK) {
-                            if(id == 1)
-                                this.act_bc_source1 = this.req_bc_source
-                            else
-                                this.act_bc_source2 = this.req_bc_source
-                        } else {
-                            this.req_bc_source = val
-                            if(id == 1)
-                                this.act_bc_source1 = this.req_bc_source
-                            else
-                                this.act_bc_source2 = this.req_bc_source
-                        }
-                        if((id == 1) && (this.act_bc_source2 != this.req_bc_source))
-                            this.set_source(2)
-                        else if((id == 2) && (this.act_bc_source1 != this.req_bc_source))
-                            this.set_source(1)
-                        this.emit('source', val);
-                        break;
-                    case COMMAND.Volume:
-                        let display_volume = bc_volume_to_display(val)
-                        console.log('[BelCanto %d] rx volume: %d to %d', id,
-                            (id == 1)?this.act_bc_volume1:this.act_bc_volume2, val, display_volume);
-                        if((rx[PACKET_TYPE_INDEX] & TYPE_ACKNACK) == TYPE_ACKNACK) {
-                            if(id == 1)
-                                this.act_bc_volume1 = this.req_bc_volume;
-                            else
-                                this.act_bc_volume2 = this.req_bc_volume;
-                        } else {
-                            this.req_bc_volume = val
-                            if(id == 1)
-                                this.act_bc_volume1 = this.req_bc_volume
-                            else
-                                this.act_bc_volume2 = this.req_bc_volume
-                        }
-                        if((id == 1) && (this.act_bc_volume2 != this.req_bc_volume))
-                            this.set_volume(2)
-                        else if((id == 2) && (this.act_bc_volume1 != this.req_bc_volume))
-                            this.set_volume(1)
-                        if(this.properties.volume != display_volume)
-                            this.emit('volume', display_volume);
-                        this.properties.volume = display_volume
-                        break;
-                    case COMMAND.Balance:
-                        console.log('[BelCanto %d] rx ignored Balance', id);
-                        break;
-                    default:
-                        console.log("[BelCanto %d] rx ignored unknown command", id, rx)
-                        break;
-                    }
-                }
-            }
+        if(is_ack || is_report) {
+            if(id == 1) this.act_bc_display1 = this.req_bc_display
+            else        this.act_bc_display2 = this.req_bc_display
         }
-    });
-
-    port.on('open', err => {
-        this.emit('preconnected');
-    });
-
-    port.on('close', () => {
-        port.close(() => {
-            port = undefined;
-            if (closecb) {
-                var cb2 = closecb;
-                closecb = undefined;
-                cb2('close');
-            }
-        })
-    });
-    port.on('error', err => {
-        port.close(() => {
-            port = undefined;
-            if (closecb) {
-                var cb2 = closecb;
-                closecb = undefined;
-                cb2('error');
-            }
-        })
-    });
-    port.on('disconnect', () => {
-        port.close(() => {
-            port = undefined;
-            if (closecb) {
-                var cb2 = closecb;
-                closecb = undefined;
-                cb2('disconnect');
-            }
-        })
-    });
-};
-
-BelCanto.prototype.start = function (opts) {
-    this.seq++;
-
-    let closecb1 = (why) => {
-        this.emit('disconnected');
-        if (why != 'close') {
-            var seq = ++this.seq;
-            setTimeout(() => {
-                if (seq != this.seq)
-                    return;
-                this.start(opts);
-            }, 1000);
+        if(is_nack) {
+            if(id == 1)this.req_bc_display = this.act_bc_display1
+            else       this.req_bc_display = this.act_bc_display2
         }
-    };
-    let closecb2 = (why) => {
-        this.emit('disconnected');
-        if (why != 'close') {
-            var seq = ++this.seq;
-            setTimeout(() => {
-                if (seq != this.seq)
-                    return;
-                this.start(opts);
-            }, 1000);
+        break;
+    case COMMAND.Mute:
+        if(is_report) {
+            this.req_bc_mute = val
+            console.log('[BelCanto %d] rx mute: %s', id, val, (val == MUTE.ON) ? "Muted" : "UnMuted");
         }
-    };
+        if(is_ack || is_report) {
+            if(id == 1) this.act_bc_mute1 = this.req_bc_mute
+            else        this.act_bc_mute2 = this.req_bc_mute
 
-    if (this.port) {
-        this.port.close(() => {
-            this.init(opts, closecb1, closecb2);
-        });
-    } else {
-        this.init(opts, closecb1, closecb2);
+            let display_mute = (val == MUTE.ON) ? "Muted" : "UnMuted"
+            this.properties.source = display_mute;
+            this.emit('source', display_mute);
+        }
+        if(is_nack) {
+            if(id == 1) this.req_bc_mute = this.act_bc_mute1
+            else        this.req_bc_mute = this.act_bc_mute2
+        }
+        break;
+    case COMMAND.Input:
+        if(is_report) {
+            this.req_bc_source = val
+            console.log('[BelCanto %d] rx source: %s', id, val);
+            this.properties.source = val;
+            this.emit('source', val);
+        }
+        if(is_ack || is_report) {
+            if(id == 1) this.act_bc_source1 = this.req_bc_source
+            else        this.act_bc_source2 = this.req_bc_source
+        }
+        if(is_nack) {
+            if(id == 1) this.req_bc_source = this.act_bc_source1
+            else        this.req_bc_source = this.act_bc_source2
+        }
+        break;
+    case COMMAND.Volume:
+        if(is_report) {
+            this.req_bc_volume = val
+            console.log('[BelCanto %d] rx volume: %d to %d', id,
+                (id == 1)?this.act_bc_volume1:this.act_bc_volume2, val, bc_volume_to_display(val),
+                (id == 1)?this.port1.path:this.port2.path);
+        }
+        if(is_ack || is_report) {
+            if(id == 1) this.act_bc_volume1 = this.req_bc_volume;
+            else        this.act_bc_volume2 = this.req_bc_volume;
+
+            let display_volume = bc_volume_to_display(this.req_bc_volume)
+            this.properties.volume = display_volume
+            this.emit('volume', display_volume);
+        }
+        if(is_nack) {
+            if(id == 1) this.req_bc_volume = this.act_bc_volume1
+            else        this.req_bc_volume = this.act_bc_volume2
+        }
+        break;
+    case COMMAND.Balance:
+        console.log('[BelCanto %d] rx ignored Balance', id);
+        break;
+    default:
+        console.log("[BelCanto %d] rx ignored unknown command", id, rx)
+        break;
     }
-};
+}
 
-BelCanto.prototype.stop = function () {
-    this.seq++;
-    if (this.port)
-        this.port.close(() => {});
-};
+//
+// TX
+//
+
+function writeToPort(port, data) {
+    port.write(data)
+}
+
+function make_tx_command(command, data, read_not_write=false) {
+    if((command == COMMAND.AckRxWrite) || (command == COMMAND.NackRxWrite))
+        return
+    else
+        return make_tx_command_(command, 0, data, read_not_write)
+}
+function make_tx_command_(command, type, data, read_not_write) {
+    if(typeof(data) == "number")
+        data = [data]
+    let datacount = data.length
+    if(datacount > 0)
+        datacount -= 1
+
+    let cmd = [FLAG]
+
+    let type_byte = TYPE_MSB | type | datacount
+    cmd.push(type_byte)
+
+    let command_byte = COMMAND_MSB | (read_not_write?COMMAND_READ:0) | command
+    cmd.push(command_byte)
+    for(let i = 0; i <= datacount; ++i) {
+        let b = data[i]
+        if((b == DLE) || (b == FLAG)) {
+            cmd.push(DLE)
+            b ^= XORCHR
+        }
+        cmd.push(b)
+    }
+
+    let checksum = type_byte
+    checksum += command_byte
+    for(let i = 0; i <= datacount; ++i) {
+        checksum += data[i]
+    }
+    cmd.push(checksum % 256)
+
+    return cmd
+}
+
+function update_all() {
+    let q = []  // notifications that need to be sent
+    if(this.act_bc_volume1 != this.req_bc_volume) q.push(0);
+    if(this.act_bc_volume2 != this.req_bc_volume) q.push(1);
+    if(this.act_bc_source1 != this.req_bc_source) q.push(2);
+    if(this.act_bc_source2 != this.req_bc_source) q.push(3);
+    if(this.act_bc_display1 != this.req_bc_display) q.push(4);
+    if(this.act_bc_display2 != this.req_bc_display) q.push(5);
+    if(this.act_bc_mute1 != this.req_bc_mute) q.push(6);
+    if(this.act_bc_mute2 != this.req_bc_mute) q.push(7);
+
+    // write one tx packet per call, to limit serial port traffic
+    if(q.length > 0) {
+        let next = null
+        while(next == null) {
+            next = q[this.next_tx_state]
+            //console.log("loop", this.next_tx_state, next, q)
+            ++this.next_tx_state
+            if(this.next_tx_state > 7)
+                this.next_tx_state = 0
+            if(next != null)
+                break;
+        }
+
+        if(next != null) {
+            switch(next) {
+                case 0: { let s = make_tx_command(COMMAND.Volume, this.req_bc_volume); writeToPort(this.port1, s); break; }
+                case 1: { let s = make_tx_command(COMMAND.Volume, this.req_bc_volume); writeToPort(this.port2, s); break; }
+                case 2: { let s = make_tx_command(COMMAND.Input, this.req_bc_source); writeToPort(this.port1, s); break; }
+                case 3: { let s = make_tx_command(COMMAND.Input, this.req_bc_source); writeToPort(this.port2, s); break; }
+                case 4: { let s = make_tx_command(COMMAND.Display, this.req_bc_display); writeToPort(this.port1, s); break; }
+                case 5: { let s = make_tx_command(COMMAND.Display, this.req_bc_display); writeToPort(this.port2, s); break; }
+                case 6: { let s = make_tx_command(COMMAND.Mute, this.req_bc_mute); writeToPort(this.port1, s); break; }
+                case 7: { let s = make_tx_command(COMMAND.Mute, this.req_bc_mute); writeToPort(this.port2, s); break; }
+            }
+        }
+    }
+}
 
 exports = module.exports = BelCanto;
