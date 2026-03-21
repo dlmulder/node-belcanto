@@ -58,7 +58,7 @@ const COMMAND_MSB = 0x80
 const COMMAND_READ = 0x40   // 1=Read, 0=Write
 const COMMAND_MASK = 0x3f
 const COMMAND = {
-    Display:2, Mute:3, Input:5, Volume:7, Balance:9, AckRxWrite:100, NackRxWrite:101
+    Display:2, Mute:3, Input:5, Volume:7, Media:8, Balance:9, AckRxWrite:100, NackRxWrite:101
 }
 
 // subsequent bytes are Data
@@ -68,6 +68,9 @@ const PACKET_DATA0_INDEX = 2
 
 const MUTE = {
     OFF:0xe0, ON:0xe1, SOFT:0xe2    // also display ON/OFF
+}
+const MEDIA = {
+    PlayPause:13, Prev:25, Next:26
 }
 
 function display_to_bc_volume(vol100) {
@@ -88,6 +91,12 @@ BelCanto.prototype.request_volume = function(vol) {
 }
 BelCanto.prototype.request_mute = function(mute) {
     this.req_bc_mute = mute? MUTE.ON : MUTE.OFF
+}
+BelCanto.prototype.request_source = function(source) {
+    this.req_bc_source = Number(source)
+}
+BelCanto.prototype.request_display = function(display) {
+    this.req_bc_display = display? MUTE.ON : MUTE.OFF
 }
 
 BelCanto.prototype.volume_up = function (id=null) {
@@ -463,6 +472,7 @@ function handle_rx_packet(rx, id) {
         if(is_ack || is_report) {
             if(id == 1) this.act_bc_source1 = this.req_bc_source
             else        this.act_bc_source2 = this.req_bc_source
+            if(is_ack) console.log('source ACK', id, this.act_bc_source1, this.act_bc_source2, this.req_bc_source);
         }
         if(is_nack) {
             if(id == 1) this.req_bc_source = this.act_bc_source1
@@ -489,6 +499,17 @@ function handle_rx_packet(rx, id) {
             else        this.req_bc_volume = this.act_bc_volume2
         }
         break;
+    case COMMAND.Media:
+        if(is_report) {
+            console.log("[BelCanto %d] media", id, val)
+            if(val == MEDIA.Next)
+                this.emit('next_pressed')
+            else if(val == MEDIA.Prev)
+                this.emit('prev_pressed')
+            else if(val == MEDIA.PlayPause)
+                this.emit('play_pause_pressed')
+        }
+        break;
     case COMMAND.Balance:
         console.log('[BelCanto %d] rx ignored Balance', id);
         break;
@@ -504,6 +525,7 @@ function handle_rx_packet(rx, id) {
 
 function writeToPort(port, data) {
     port.write(data)
+    console.log("write", data)
 }
 
 function make_tx_command(command, data, read_not_write=false) {
@@ -569,6 +591,7 @@ function update_all() {
                 break;
         }
 
+        console.log("q", q)
         if(next != null) {
             switch(next) {
                 case 0: { let s = make_tx_command(COMMAND.Volume, this.req_bc_volume); writeToPort(this.port1, s); break; }
