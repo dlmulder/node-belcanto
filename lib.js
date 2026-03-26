@@ -12,6 +12,8 @@ const rx_packets2 = [];
 
 function BelCanto() {
     this.seq = 0;
+    this.is_connected1 = false;
+    this.is_connected2 = false;
     this.req_bc_volume = -1;   // requested
     this.act_bc_volume1 = -1;  // actual (after a set command has been ACKed)
     this.act_bc_volume2 = -1;
@@ -24,6 +26,9 @@ function BelCanto() {
     this.req_bc_source = null;
     this.act_bc_source1 = null;
     this.act_bc_source2 = null;
+    this.req_bc_control = null;
+    //this.act_bc_control1 = null;  either of the BelCanto units can be silenced, but not both
+    this.act_bc_control2 = null;
 }
 
 util.inherits(BelCanto, events.EventEmitter);
@@ -58,7 +63,7 @@ const COMMAND_MSB = 0x80
 const COMMAND_READ = 0x40   // 1=Read, 0=Write
 const COMMAND_MASK = 0x3f
 const COMMAND = {
-    Display:2, Mute:3, Input:5, Volume:7, Media:8, Balance:9, AckRxWrite:100, NackRxWrite:101
+    Display:2, Mute:3, Input:5, Volume:7, Media:8, Balance:9, Control:53, AckRxWrite:100, NackRxWrite:101
 }
 
 // subsequent bytes are Data
@@ -97,6 +102,11 @@ BelCanto.prototype.request_source = function(source) {
 }
 BelCanto.prototype.request_display = function(display) {
     this.req_bc_display = display? MUTE.ON : MUTE.OFF
+}
+BelCanto.prototype.request_control = function(control) {
+    this.req_bc_control = control? 1 : 0
+    // there's only one Control bit, which disables sending everything except ACK/NACK packets
+    // to minimize SerialPort collisions from multiple SerialPorts receiving at the same time
 }
 
 BelCanto.prototype.volume_up = function (id=null) {
@@ -166,7 +176,8 @@ BelCanto.prototype.start = function (opts) {
     this.seq++;
 
     let closecb1 = (why) => {
-        this.emit('disconnected');
+        this.emit('disconnected', why);
+        this.is_connected1 = false
         if (why != 'close') {
             var seq = ++this.seq;
             setTimeout(() => {
@@ -177,7 +188,8 @@ BelCanto.prototype.start = function (opts) {
         }
     };
     let closecb2 = (why) => {
-        this.emit('disconnected');
+        this.emit('disconnected', why);
+        this.is_connected2 = false
         if (why != 'close') {
             var seq = ++this.seq;
             setTimeout(() => {
@@ -199,8 +211,10 @@ BelCanto.prototype.start = function (opts) {
 
 BelCanto.prototype.stop = function () {
     this.seq++;
-    if (this.port)
-        this.port.close(() => {});
+    if (this.port1)
+        this.port1.close(() => {});
+    if (this.port2)
+        this.port2.close(() => {});
 };
 
 
@@ -215,6 +229,10 @@ function handle_system_events(rx_bytes, parser, port, closecb) {
 
     port.on('open', err => {
         this.emit('preconnected');
+        if(port == this.port1)
+            this.is_connected1 = true
+        else if(port == this.port2)
+            this.is_connected2 = true
     });
 
     port.on('close', () => {
@@ -223,8 +241,12 @@ function handle_system_events(rx_bytes, parser, port, closecb) {
             if (closecb) {
                 var cb2 = closecb;
                 closecb = undefined;
-                cb2('close');
+                cb2('close ' + port.path);
             }
+            if(port == this.port1)
+                this.is_connected1 = false
+            else if(port == this.port2)
+                this.is_connected2 = false
         })
     });
     port.on('error', err => {
@@ -233,8 +255,12 @@ function handle_system_events(rx_bytes, parser, port, closecb) {
             if (closecb) {
                 var cb2 = closecb;
                 closecb = undefined;
-                cb2('error');
+                cb2(err);
             }
+            if(port == this.port1)
+                this.is_connected1 = false
+            else if(port == this.port2)
+                this.is_connected2 = false
         })
     });
     port.on('disconnect', () => {
@@ -243,8 +269,12 @@ function handle_system_events(rx_bytes, parser, port, closecb) {
             if (closecb) {
                 var cb2 = closecb;
                 closecb = undefined;
-                cb2('disconnect');
+                cb2('disconnect ' + port.path);
             }
+            if(port == this.port1)
+                this.is_connected1 = false
+            else if(port == this.port2)
+                this.is_connected2 = false
         })
     });
 };
@@ -263,7 +293,7 @@ function handle_timers() {
             }
             rx_bytes1.length = 0
         }
-    }, 2)
+    }, 8)
 
     const rx_bytes_timer2 = setInterval(() => {
         if(rx_bytes2.length > 0) {
@@ -278,7 +308,7 @@ function handle_timers() {
             }
             rx_bytes2.length = 0
         }
-    }, 2)
+    }, 8)
 
     const rx_packets_timer1 = setInterval(() => {
         if(rx_packets1.length > 0) {
@@ -287,11 +317,11 @@ function handle_timers() {
                 handle_rx_packet.call(this, p, 1)
             }
             rx_packets1.length = 0
-        }
 
-        if (this.initializing) {
-            this.initializing = false;
-            this.emit('connected');
+            if (this.initializing) {
+                this.initializing = false;
+                this.emit('connected');
+            }
         }
     }, 25);
 
@@ -307,7 +337,7 @@ function handle_timers() {
 
     const update_all_timer = setInterval(() => {
         update_all.call(this)
-    }, 42)
+    }, 100) // time to receive two packets after sending one
 }
 
 
@@ -472,7 +502,6 @@ function handle_rx_packet(rx, id) {
         if(is_ack || is_report) {
             if(id == 1) this.act_bc_source1 = this.req_bc_source
             else        this.act_bc_source2 = this.req_bc_source
-            if(is_ack) console.log('source ACK', id, this.act_bc_source1, this.act_bc_source2, this.req_bc_source);
         }
         if(is_nack) {
             if(id == 1) this.req_bc_source = this.act_bc_source1
@@ -513,6 +542,20 @@ function handle_rx_packet(rx, id) {
     case COMMAND.Balance:
         console.log('[BelCanto %d] rx ignored Balance', id);
         break;
+    case COMMAND.Control:
+        if(is_report) {
+            this.req_bc_control = val
+            console.log('[BelCanto %d] rx control: %d to %d', id,
+                (id == 1)?-1:this.act_bc_control2, val,
+                (id == 1)?this.port1.path:this.port2.path);
+        }
+        if(is_ack || is_report) {
+            if(id == 2) this.act_bc_control2 = this.req_bc_control;
+        }
+        if(is_nack) {
+            if(id == 2) this.req_bc_control = this.act_bc_control2
+        }
+        break;
     default:
         console.log("[BelCanto %d] rx ignored unknown command", id, rx)
         break;
@@ -524,8 +567,10 @@ function handle_rx_packet(rx, id) {
 //
 
 function writeToPort(port, data) {
-    port.write(data)
-    console.log("write", data)
+    if(port.isOpen) {
+        port.write(data)
+        console.log("write", data)
+    }
 }
 
 function make_tx_command(command, data, read_not_write=false) {
@@ -569,14 +614,14 @@ function make_tx_command_(command, type, data, read_not_write) {
 
 function update_all() {
     let q = []  // notifications that need to be sent
-    if(this.act_bc_volume1 != this.req_bc_volume) q.push(0);
-    if(this.act_bc_volume2 != this.req_bc_volume) q.push(1);
-    if(this.act_bc_source1 != this.req_bc_source) q.push(2);
-    if(this.act_bc_source2 != this.req_bc_source) q.push(3);
-    if(this.act_bc_display1 != this.req_bc_display) q.push(4);
-    if(this.act_bc_display2 != this.req_bc_display) q.push(5);
-    if(this.act_bc_mute1 != this.req_bc_mute) q.push(6);
-    if(this.act_bc_mute2 != this.req_bc_mute) q.push(7);
+    if(this.is_connected1 && (this.act_bc_volume1 != this.req_bc_volume)) q.push(0);
+    if(this.is_connected2 && (this.act_bc_volume2 != this.req_bc_volume)) q.push(1);
+    if(this.is_connected1 && (this.act_bc_source1 != this.req_bc_source)) q.push(2);
+    if(this.is_connected2 && (this.act_bc_source2 != this.req_bc_source)) q.push(3);
+    if(this.is_connected1 && (this.act_bc_display1 != this.req_bc_display)) q.push(4);
+    if(this.is_connected2 && (this.act_bc_display2 != this.req_bc_display)) q.push(5);
+    if(this.is_connected1 && (this.act_bc_mute1 != this.req_bc_mute)) q.push(6);
+    if(this.is_connected2 && (this.act_bc_mute2 != this.req_bc_mute)) q.push(7);
 
     // write one tx packet per call, to limit serial port traffic
     if(q.length > 0) {
